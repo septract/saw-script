@@ -324,6 +324,7 @@ library saw-core-lean
     mtl,
     prettyprinter,
     text,
+    zenc,
 
     -- internal sublibraries in the saw tree
     saw:saw-support,
@@ -335,6 +336,7 @@ library saw-core-lean
     Language.Lean.Pretty
     SAWCoreLean.Lean
     SAWCoreLean.Monad
+    SAWCoreLean.SpecialTreatment
     SAWCoreLean.Term
 
 -- A direct-link smoke test for the Lean translator. Exercises the
