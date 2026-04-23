@@ -172,7 +172,16 @@ prettyTerm p e =
       -- continuation lines by 2.
       parensIf (p > PrecApp) $ group $ hang 2 $ fillSep (f' : args')
     Sort s ->
-      prettySort s
+      -- @Sort u@ and @Type n@ are compound syntactic forms (keyword
+      -- + argument). When used in an atom position (e.g. as an
+      -- argument to another function), parens are required so Lean
+      -- doesn't parse the universe argument as another argument to
+      -- the outer function. @Prop@ and bare @Type@ are single
+      -- tokens and never need parens.
+      case s of
+        Prop       -> "Prop"
+        TypeLvl 0  -> "Type"
+        _          -> parensIf (p >= PrecAtom) (prettySort s)
     Var x ->
       prettyIdent x
     ExplVar x ->

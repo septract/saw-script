@@ -27,10 +27,13 @@ module SAWCoreLean.Term
   ( -- * Monad
     TermTranslationMonad
   , TranslationState(..)
+  , Sort0Mode(..)
   , runTermTranslationMonad
   , globalDeclarations
   , topLevelDeclarations
   , universeVars
+  , sort0Mode
+  , sharedSort0Var
     -- * Translation
   , translateTerm
   , translateDefDoc
@@ -43,7 +46,7 @@ module SAWCoreLean.Term
   , mkDefinitionWith
   ) where
 
-import           Control.Lens                 (makeLenses, over, view)
+import           Control.Lens                 (makeLenses, over, set, view)
 import qualified Control.Monad.Except         as Except
 import           Control.Monad.Reader         (MonadReader(local), asks)
 import           Control.Monad.State          (MonadState(get), modify)
@@ -92,6 +95,32 @@ data TranslationReader = TranslationReader
 
 makeLenses ''TranslationReader
 
+-- | How sort-0 binder types are translated.
+--
+-- SAWCore's @sort 0@ is cumulatively above @Prop@; Lean's @Type 0@
+-- is disjoint from @Prop@. Under the sound translation, we
+-- universe-polymorphise sort-0 binders (emit @Sort u@) so Lean can
+-- instantiate @u := 0@ (Prop) or @u := 1@ (Type 0) as the caller
+-- requires.
+--
+-- How to share universe variables across a declaration's multiple
+-- sort-0 binders depends on the kind of declaration:
+data Sort0Mode
+  = Sort0PerBinder
+    -- ^ Each sort-0 binder gets a fresh universe variable. Correct
+    -- for /inductive declarations/ — an @inductive Foo (a : sort 0)
+    -- (b : sort 0) : sort 0@ translates to @Foo.{u, v} (a : Sort u)
+    -- (b : Sort v) : Sort (max 1 (max u v))@, and use sites can
+    -- instantiate each parameter independently.
+  | Sort0SharedPerDef
+    -- ^ All sort-0 binders in a def share a single fresh universe
+    -- variable. Correct for /definitions/ that have @Eq@ between
+    -- their sort-0 binders (e.g. @coerce__def : (a b : sort 0) ->
+    -- Eq (sort 0) a b -> ...@) — sharing a universe preserves the
+    -- implicit SAWCore constraint "these binders are at the same
+    -- sort" that the Eq unification would otherwise reject.
+  deriving (Eq, Show)
+
 -- | Mutable state collected during translation.
 data TranslationState = TranslationState
   { _globalDeclarations   :: [Lean.Ident]
@@ -105,6 +134,15 @@ data TranslationState = TranslationState
     -- ^ Universe-variable names seen during translation of the
     -- current declaration. Emitted into the def/axiom's universe
     -- list so the result is well-formed Lean (@def foo.{u0 u1} ...@).
+  , _sort0Mode            :: Sort0Mode
+    -- ^ Per-top-level-entry setting: how sort-0 binders get
+    -- universe-polymorphised. Defaults to 'Sort0SharedPerDef'; the
+    -- inductive-translation entry point (in "SAWCoreLean.SAWModule")
+    -- sets 'Sort0PerBinder' before translating parameters.
+  , _sharedSort0Var       :: Maybe String
+    -- ^ Under 'Sort0SharedPerDef' mode, caches the first sort-0
+    -- universe variable allocated. Subsequent sort-0 binders reuse
+    -- it. Cleared at the start of each top-level entry.
   }
 
 makeLenses ''TranslationState
@@ -160,8 +198,19 @@ reservedIdents =
 translateSort :: TermTranslationMonad m => Sort -> m Lean.Sort
 translateSort s = case s of
   PropSort   -> pure Lean.Prop
-  TypeSort 0 -> pure Lean.Type
+  TypeSort 0 -> do
+    -- Universe-polymorphise 'sort 0' occurrences: allocate (or
+    -- reuse, under 'Sort0SharedPerDef') a universe variable so
+    -- SAWCore's cumulativity (@Prop <= Type 0@) is respected on
+    -- the Lean side. Use sites with 'Prop'-valued arguments pick
+    -- @u := 0@; Type-valued pick @u := 1@.
+    uname <- sort0UniverseName
+    modify (over universeVars (Set.insert uname))
+    pure (Lean.SortVar uname)
   TypeSort _ -> do
+    -- 'sort k' for @k >= 1@ always allocates fresh (independent
+    -- per-occurrence) to preserve the Eq__rec style motive
+    -- independence. See 'translateSort' docstring.
     uname <- freshUniverseName
     modify (over universeVars (Set.insert uname))
     pure (Lean.SortVar uname)
@@ -174,6 +223,32 @@ freshUniverseName = do
   let pick n = let name = "u" ++ show (n :: Int)
                in if name `Set.member` used then pick (n + 1) else name
   pure (pick 1)
+
+-- | Allocate (or reuse) the universe variable for a SAWCore
+-- @sort 0@ occurrence, per the current 'sort0Mode':
+--
+-- * 'Sort0PerBinder' (set by 'SAWCoreLean.SAWModule' for
+--   inductives): each call allocates a fresh variable. Correct for
+--   @data Foo (a : sort 0) (b : sort 0) : sort 0@, whose parameters
+--   can be independently instantiated at use sites.
+-- * 'Sort0SharedPerDef' (default, used by definitions): the first
+--   call allocates a variable and caches it in 'sharedSort0Var';
+--   subsequent calls reuse it. Required by defs like @coerce__def :
+--   (a b : sort 0) -> Eq (sort 0) a b -> …@ whose internal @Eq@
+--   would otherwise fail to unify across independent universes.
+sort0UniverseName :: TermTranslationMonad m => m String
+sort0UniverseName = do
+  mode <- view sort0Mode <$> get
+  case mode of
+    Sort0PerBinder -> freshUniverseName
+    Sort0SharedPerDef -> do
+      cached <- view sharedSort0Var <$> get
+      case cached of
+        Just u  -> pure u
+        Nothing -> do
+          u <- freshUniverseName
+          modify (set sharedSort0Var (Just u))
+          pure u
 
 -- | Append @'@ until the identifier is not in use.
 nextVariant :: Lean.Ident -> Lean.Ident
@@ -770,6 +845,16 @@ runTermTranslationMonad configuration mname mm globals localEnv =
        { _globalDeclarations   = globals
        , _topLevelDeclarations = []
        , _universeVars         = Set.empty
+       , _sort0Mode            = Sort0PerBinder
+         -- Default: each sort-0 binder gets its own fresh universe
+         -- variable. Lean's elaborator infers universe equalities
+         -- where the body forces them (e.g. two binders unified
+         -- via an @Eq@ between them). Tighter sharing policies
+         -- forbid valid call sites where the caller legitimately
+         -- passes args at different universes (e.g. @Pair_fst a
+         -- (PairType b UnitType) tup@ where @a@ and @PairType b
+         -- UnitType@ are at different universes).
+       , _sharedSort0Var       = Nothing
        })
 
 -- | Translate a SAWCore 'Term' and its type to a Lean @def@, together
